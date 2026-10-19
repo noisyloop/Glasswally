@@ -48,6 +48,22 @@ pub struct IocFeedEntry {
 /// would let an attacker forge cross-provider IOC bundles.
 pub const MIN_IOC_KEY_LEN: usize = 32;
 
+/// Largest feed file `consume_file` will read into memory.
+pub const MAX_FEED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Tolerated clock skew for `last_seen` timestamps in the future. A bundle
+/// dated further ahead would stay "fresh" indefinitely.
+const MAX_FUTURE_SKEW: Duration = Duration::minutes(5);
+
+/// Bytes covered by the HMAC. Binds schema version and provider id to the
+/// bundle so a relay can't relabel a signed bundle as coming from a
+/// different provider (or a different schema) without breaking the MAC.
+fn signing_input(schema_version: &str, provider_id: &str, bundle: &IocBundle) -> Vec<u8> {
+    let bundle_json = serde_json::to_string(bundle).unwrap_or_default();
+    // serde_json string encoding makes the fields unambiguous to split.
+    serde_json::to_vec(&(schema_version, provider_id, bundle_json)).unwrap_or_default()
+}
+
 impl IocFeedEntry {
     pub fn new(
         bundle: IocBundle,
@@ -55,10 +71,13 @@ impl IocFeedEntry {
         signing_key: &[u8],
     ) -> Result<Self> {
         let provider_id = provider_id.into();
-        let canonical = serde_json::to_string(&bundle).unwrap_or_default();
-        let signature = hmac_sign(canonical.as_bytes(), signing_key)?;
+        let schema_version = "glasswally/ioc/v1".to_string();
+        let signature = hmac_sign(
+            &signing_input(&schema_version, &provider_id, &bundle),
+            signing_key,
+        )?;
         Ok(Self {
-            schema_version: "glasswally/ioc/v1".into(),
+            schema_version,
             provider_id,
             bundle,
             signature,
@@ -69,8 +88,8 @@ impl IocFeedEntry {
     /// Verify the HMAC signature. Constant-time comparison.
     /// Fails closed: an empty/short key or a signing error yields `false`.
     pub fn verify(&self, key: &[u8]) -> bool {
-        let canonical = serde_json::to_string(&self.bundle).unwrap_or_default();
-        let expected = match hmac_sign(canonical.as_bytes(), key) {
+        let input = signing_input(&self.schema_version, &self.provider_id, &self.bundle);
+        let expected = match hmac_sign(&input, key) {
             Ok(sig) => sig,
             Err(_) => return false,
         };
@@ -87,8 +106,11 @@ impl IocFeedEntry {
     }
 
     /// True if this IOC was active in the last 24 hours.
+    /// Rejects bundles dated in the future (beyond clock skew), which would
+    /// otherwise never age out.
     pub fn is_fresh(&self) -> bool {
-        Utc::now() - self.bundle.last_seen < Duration::hours(24)
+        let age = Utc::now() - self.bundle.last_seen;
+        age < Duration::hours(24) && age > -MAX_FUTURE_SKEW
     }
 
     pub fn to_jsonl(&self) -> String {
@@ -197,6 +219,15 @@ impl IocFeedConsumer {
 
     /// Read and consume from a file.
     pub async fn consume_file(&self, path: &Path) -> Result<Vec<IocFeedEntry>> {
+        let len = tokio::fs::metadata(path).await?.len();
+        if len > MAX_FEED_BYTES {
+            anyhow::bail!(
+                "IOC feed {} too large ({} bytes, max {})",
+                path.display(),
+                len,
+                MAX_FEED_BYTES
+            );
+        }
         let content = tokio::fs::read_to_string(path).await?;
         Ok(self.consume(&content))
     }
@@ -329,4 +360,53 @@ fn hmac_sign(data: &[u8], key: &[u8]) -> Result<String> {
         HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
     mac.update(data);
     Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    fn bundle(last_seen: DateTime<Utc>) -> IocBundle {
+        IocBundle {
+            cluster_id: 1,
+            ip_addresses: vec!["10.0.0.1".into()],
+            ip_subnets: vec![],
+            payment_hashes: vec![],
+            ja3_hashes: vec![],
+            ja3s_hashes: vec![],
+            header_order_hashes: vec![],
+            h2_fingerprints: vec![],
+            watermark_tokens: vec![],
+            account_ids: vec!["a".into()],
+            country_codes: vec![],
+            first_seen: last_seen,
+            last_seen,
+            total_requests: 1,
+            targeted_capabilities: vec![],
+            confidence: 0.9,
+            timestamp: last_seen,
+        }
+    }
+
+    #[test]
+    fn roundtrip_verifies() {
+        let e = IocFeedEntry::new(bundle(Utc::now()), "provider-a", KEY).unwrap();
+        let got = IocFeedConsumer::new(KEY.to_vec()).consume(&e.to_jsonl());
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn relabeled_provider_fails_verification() {
+        let mut e = IocFeedEntry::new(bundle(Utc::now()), "provider-a", KEY).unwrap();
+        e.provider_id = "provider-b".into();
+        assert!(!e.verify(KEY));
+    }
+
+    #[test]
+    fn future_dated_bundle_is_not_fresh() {
+        let e = IocFeedEntry::new(bundle(Utc::now() + Duration::days(365)), "p", KEY).unwrap();
+        assert!(!e.is_fresh());
+    }
 }

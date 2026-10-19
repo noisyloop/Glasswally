@@ -196,7 +196,10 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         evidence.push(format!("archetype_match:{}", archetype_hits.join(",")));
     }
     if reuse_score > 0.0 {
-        evidence.push(format!("template_reuse:hash={}", &preamble_src[..6]));
+        evidence.push(format!(
+            "template_reuse:hash={}",
+            preamble_src.get(..6).unwrap_or(&preamble_src)
+        ));
     }
     if collision_score > 0.0 {
         let n = store.accounts_with_preamble_hash(&preamble_src);

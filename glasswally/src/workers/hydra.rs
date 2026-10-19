@@ -166,9 +166,8 @@ fn payment_bin_groups(
 ) -> std::collections::HashMap<String, usize> {
     let mut groups: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for pm in payments {
-        if pm.len() >= 3 {
-            let prefix = pm[..3].to_string();
-            *groups.entry(prefix).or_insert(0) += 1;
+        if let Some(prefix) = pm.get(..3) {
+            *groups.entry(prefix.to_string()).or_insert(0) += 1;
         }
     }
     groups
@@ -233,8 +232,8 @@ pub(crate) fn virtual_card_clustering(
     }
     let mut prefix2: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for pm in payments {
-        if pm.len() >= 2 {
-            *prefix2.entry(pm[..2].to_string()).or_default() += 1;
+        if let Some(prefix) = pm.get(..2) {
+            *prefix2.entry(prefix.to_string()).or_default() += 1;
         }
     }
     prefix2

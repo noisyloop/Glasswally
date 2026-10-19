@@ -41,6 +41,18 @@ pub const W_24HR: i64 = 24 * 60 * 60;
 /// takedown cluster. Past this fan-out we stop re-expanding the cluster.
 pub const MAX_CLUSTER_FANOUT: usize = 512;
 
+/// Per-account cap on retained events / model observations. Time-based
+/// expiry alone does not bound memory: a single high-rate account (or one
+/// sending future-dated timestamps, which never expire) could otherwise
+/// grow its window without limit.
+pub const MAX_EVENTS_PER_ACCOUNT: usize = 10_000;
+
+/// Per-account cap on recorded model switches (only recent ones matter).
+pub const MAX_MODEL_SWITCHES: usize = 256;
+
+/// How long cross-account timing buckets are kept.
+pub const TIMING_BUCKET_RETENTION_SECS: i64 = 600;
+
 // ── Per-account window ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,7 +131,14 @@ impl AccountWindow {
         }
         self.models_seen
             .push((event.timestamp, event.model.clone()));
+        if self.models_seen.len() > MAX_EVENTS_PER_ACCOUNT {
+            let excess = self.models_seen.len() - MAX_EVENTS_PER_ACCOUNT;
+            self.models_seen.drain(..excess);
+        }
         self.events.push_back(event.clone());
+        while self.events.len() > MAX_EVENTS_PER_ACCOUNT {
+            self.events.pop_front();
+        }
     }
 
     pub fn events_in(&self, seconds: i64) -> Vec<&ApiEvent> {
@@ -183,6 +202,7 @@ impl AccountWindow {
         {
             self.events.pop_front();
         }
+        self.models_seen.retain(|(ts, _)| *ts >= cutoff);
     }
 }
 
@@ -277,10 +297,15 @@ impl StateStore {
             let r = window.read();
             if let Some(last) = r.events.back() {
                 if !last.model.is_empty() && last.model != event.model {
-                    self.model_switches
+                    let mut switches = self
+                        .model_switches
                         .entry(event.account_id.clone())
-                        .or_default()
-                        .push((event.timestamp, last.model.clone(), event.model.clone()));
+                        .or_default();
+                    switches.push((event.timestamp, last.model.clone(), event.model.clone()));
+                    if switches.len() > MAX_MODEL_SWITCHES {
+                        let excess = switches.len() - MAX_MODEL_SWITCHES;
+                        switches.drain(..excess);
+                    }
                 }
             }
         }
@@ -548,13 +573,22 @@ impl StateStore {
     pub async fn housekeeping_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
-            let cutoff_secs = (Utc::now() - chrono::Duration::seconds(W_24HR)).timestamp() as u64;
+            let now = Utc::now();
             for entry in self.accounts.iter() {
                 entry.value().write().expire_old();
             }
-            // Expire old timing buckets (keep last 10 minutes)
+            // Expire old model switches (pivot ignores anything > 24h old).
+            let switch_cutoff = now - chrono::Duration::seconds(W_24HR);
+            self.model_switches.retain(|_, s| {
+                s.retain(|(ts, _, _)| *ts >= switch_cutoff);
+                !s.is_empty()
+            });
+            // Expire old timing buckets (keep last 10 minutes). Previously
+            // this kept 24h + 10min of per-second buckets, growing memory
+            // far beyond what burst detection needs.
+            let bucket_cutoff = (now.timestamp() - TIMING_BUCKET_RETENTION_SECS).max(0) as u64;
             self.timing_buckets
-                .retain(|&bucket, _| bucket >= cutoff_secs.saturating_sub(600));
+                .retain(|&bucket, _| bucket >= bucket_cutoff);
         }
     }
 }

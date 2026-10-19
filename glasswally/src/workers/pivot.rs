@@ -30,8 +30,8 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     let mut score = 0.20f32; // single-account pivot = mild
     let mut evidence = vec![format!(
         "model_pivot:{}→{}",
-        &old_model[old_model.len().saturating_sub(10)..],
-        &new_model[new_model.len().saturating_sub(10)..]
+        tail_chars(old_model, 10),
+        tail_chars(new_model, 10)
     )];
 
     // Check for cluster-wide coordinated pivot
@@ -74,4 +74,15 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         .collect(),
         timestamp: Utc::now(),
     })
+}
+
+/// Last `n` characters of `s`. Model names are client-controlled, so byte
+/// slicing could split a multi-byte char and panic the worker.
+fn tail_chars(s: &str, n: usize) -> &str {
+    let start = s
+        .char_indices()
+        .rev()
+        .nth(n.saturating_sub(1))
+        .map_or(0, |(i, _)| i);
+    &s[start..]
 }
