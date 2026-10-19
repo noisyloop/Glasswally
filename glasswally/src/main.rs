@@ -28,6 +28,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -49,6 +50,12 @@ mod workers;
 /// Drop pathologically long JSONL lines instead of parsing them — bounds
 /// memory/CPU if the feed file is attacker-influenced.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Max events processed concurrently. The source channel is bounded, but
+/// spawning a task per event without a cap would move the backlog into an
+/// unbounded set of tasks under a flood; with the cap, back-pressure reaches
+/// the source instead.
+const MAX_IN_FLIGHT: usize = 4096;
 
 use engine::{dispatcher::Dispatcher, fusion::FusionEngine};
 use events::{ActionKind, ApiEvent, RiskTier};
@@ -215,35 +222,70 @@ async fn print_stats_loop(store: Arc<StateStore>, start: Instant) {
 // ── Event sources ─────────────────────────────────────────────────────────────
 
 async fn tail_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, seek_end: bool) -> Result<()> {
-    let file = tokio::fs::File::open(&path).await?;
-    let mut lines = BufReader::new(file).lines();
-
+    let mut file = tokio::fs::File::open(&path).await?;
     if seek_end {
-        while lines.next_line().await?.is_some() {} // consume existing
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::End(0)).await?;
     }
+    let mut reader = BufReader::new(file);
 
     info!("Tailing {}", path.display());
+    // Bytes of the current, not yet newline-terminated line. Reading raw
+    // bytes (instead of `lines()`) matters for a feed that may be
+    // attacker-influenced:
+    //   - a line is capped at MAX_LINE_BYTES *while* reading, not after the
+    //     whole thing has been buffered;
+    //   - invalid UTF-8 skips one line instead of returning an error that
+    //     ends the tail task and silently stops all detection;
+    //   - a line still being written at EOF is kept until its newline
+    //     arrives instead of being parsed (and lost) as two fragments.
+    let mut line: Vec<u8> = Vec::new();
+    let mut oversized = false;
     loop {
-        match lines.next_line().await? {
-            Some(line) => {
-                if line.len() > MAX_LINE_BYTES {
-                    warn!("Dropping oversized feed line ({} bytes)", line.len());
-                    continue;
-                }
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<ApiEvent>(&line) {
-                    Ok(ev) => {
-                        if tx.send(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => warn!("Parse error: {}", e),
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            continue;
+        }
+        let (consumed, complete) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(nl) => (nl + 1, true),
+            None => (chunk.len(), false),
+        };
+        if !oversized {
+            let take = if complete { consumed - 1 } else { consumed };
+            if line.len() + take > MAX_LINE_BYTES {
+                oversized = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(&chunk[..take]);
+            }
+        }
+        reader.consume(consumed);
+        if !complete {
+            continue;
+        }
+
+        if oversized {
+            warn!("Dropping oversized feed line (> {} bytes)", MAX_LINE_BYTES);
+            oversized = false;
+            continue;
+        }
+        let raw = std::mem::take(&mut line);
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            warn!("Dropping feed line with invalid UTF-8");
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ApiEvent>(text) {
+            Ok(ev) => {
+                if tx.send(ev).await.is_err() {
+                    break;
                 }
             }
-            None => tokio::time::sleep(tokio::time::Duration::from_millis(50)).await,
+            Err(e) => warn!("Parse error: {}", e),
         }
     }
     Ok(())
@@ -336,7 +378,10 @@ async fn main() -> Result<()> {
             println!("  Output: \x1b[90m{}\x1b[0m\n", cli.output.display());
             let path = cli.path.clone();
             tokio::spawn(async move {
-                tail_jsonl(path, tx2, true).await.ok();
+                // Surface the failure: a dead tail task means no detection.
+                if let Err(e) = tail_jsonl(path, tx2, true).await {
+                    error!("Tail source stopped — detection is no longer running: {e}");
+                }
             });
         }
 
@@ -365,16 +410,22 @@ async fn main() -> Result<()> {
     // the process alive.
     drop(tx);
 
-    // Main consumer — spawn one task per event for parallelism
+    // Main consumer — one task per event for parallelism, bounded.
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     while let Some(event) = rx.recv().await {
+        let permit = Arc::clone(&in_flight)
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
         let p = Arc::clone(&pipeline);
         tokio::spawn(async move {
+            let _permit = permit;
             p.process(event).await;
         });
     }
 
-    // Let in-flight per-event tasks finish printing before exit.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait for in-flight per-event tasks to finish before exit.
+    let _ = in_flight.acquire_many(MAX_IN_FLIGHT as u32).await;
     let events = pipeline
         .store
         .total_events

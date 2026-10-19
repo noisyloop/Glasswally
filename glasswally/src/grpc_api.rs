@@ -198,8 +198,15 @@ impl QueryServer {
             let resp_bytes = serde_json::to_vec(&resp)?;
 
             let resp_len = resp_bytes.len() as u32;
-            stream.write_all(&resp_len.to_le_bytes()).await?;
-            stream.write_all(&resp_bytes).await?;
+            let mut frame = Vec::with_capacity(4 + resp_bytes.len());
+            frame.extend_from_slice(&resp_len.to_le_bytes());
+            frame.extend_from_slice(&resp_bytes);
+            // Bound the write too: a client that never reads would otherwise
+            // block here forever, pinning one of the MAX_CONNS permits; enough
+            // of them lock every gateway out of the API.
+            timeout(IO_TIMEOUT, stream.write_all(&frame))
+                .await
+                .map_err(|_| anyhow::anyhow!("client write timed out"))??;
         }
         Ok(())
     }

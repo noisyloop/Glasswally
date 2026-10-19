@@ -11,6 +11,7 @@
 //   - User-Agent (for JA3 mismatch detection)
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::events::{HttpRequest, SslCapture, SslDirection};
 
@@ -28,6 +29,12 @@ const MAX_CONNS: usize = 8192;
 /// "complete at the header boundary". Beyond this we refuse to keep
 /// buffering for a body that will never plausibly arrive.
 const MAX_CONTENT_LENGTH: usize = 8 * 1024 * 1024; // 8 MiB
+
+/// A reassembling request that has seen no new data for this long is
+/// considered abandoned and may be evicted. `flush()` is not wired to a
+/// close event, so without this the map would fill with dead partial
+/// requests and then refuse to track any new connection at all.
+const STALE_AFTER: Duration = Duration::from_secs(30);
 
 // ── HTTP parser ───────────────────────────────────────────────────────────────
 
@@ -142,7 +149,15 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 fn derive_account_id(auth: &str) -> String {
     use sha2::{Digest, Sha256};
     // Extract the key part (after "Bearer " if present)
-    let key = auth.trim_start_matches("Bearer ").trim();
+    // The auth scheme is case-insensitive (RFC 9110 §11.1), so "bearer",
+    // "BEARER" and extra whitespace must all map to the same account —
+    // otherwise one key can be split into many account ids to dilute
+    // per-account signals.
+    let auth = auth.trim();
+    let key = match auth.split_once(char::is_whitespace) {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim(),
+        _ => auth,
+    };
     let mut hasher = Sha256::new();
     hasher.update(b"gw_acct_v1:");
     hasher.update(key.as_bytes());
@@ -209,8 +224,8 @@ fn extract_model_from_path(path: &str) -> Option<String> {
 // We buffer per-connection until we see a complete request.
 
 pub struct StreamReassembler {
-    /// Per-connection partial buffers
-    buffers: HashMap<u64, String>, // key = pid<<32|fd
+    /// Per-connection partial buffers + time of last append
+    buffers: HashMap<u64, (Instant, String)>, // key = pid<<32|fd
 }
 
 impl StreamReassembler {
@@ -235,29 +250,33 @@ impl StreamReassembler {
                 self.buffers.remove(&key);
                 return None;
             }
-            // Refuse to start tracking new connections once the map is full,
-            // rather than growing it without bound under a partial-request flood.
+            // Keep the map bounded under a partial-request flood. Evict
+            // stale/oldest entries instead of refusing new connections:
+            // refusing would let a flood of never-completed requests blind
+            // the reassembler to every connection opened afterwards.
             if !self.buffers.contains_key(&key) && self.buffers.len() >= MAX_CONNS {
-                return None;
+                self.evict();
             }
             // New request — replace any partial buffer
-            self.buffers.insert(key, capture.text.clone());
+            self.buffers
+                .insert(key, (Instant::now(), capture.text.clone()));
         } else {
             // Continuation — append only to an already-tracked request.
             // A continuation with no in-flight request cannot be a valid
             // request start, so we drop it instead of allocating a buffer
             // (which would let stray chunks grow the connection map).
-            let buf = self.buffers.get_mut(&key)?;
+            let (last, buf) = self.buffers.get_mut(&key)?;
             if buf.len().saturating_add(capture.text.len()) > MAX_REQUEST_BYTES {
                 // Oversized / never-completing request — abandon it.
                 self.buffers.remove(&key);
                 return None;
             }
             buf.push_str(&capture.text);
+            *last = Instant::now();
         }
 
         // Try to parse whatever we have
-        let buf = self.buffers.get(&key)?;
+        let (_, buf) = self.buffers.get(&key)?;
         if is_complete_http_request(buf) {
             let buf_clone = buf.clone();
             self.buffers.remove(&key);
@@ -270,19 +289,38 @@ impl StreamReassembler {
     /// Flush a connection's buffer (called on tcp_close).
     pub fn flush(&mut self, pid: u32, fd: i32) -> Option<String> {
         let key = ((pid as u64) << 32) | ((fd as u64) & 0xFFFFFFFF);
-        self.buffers.remove(&key)
+        self.buffers.remove(&key).map(|(_, b)| b)
+    }
+
+    /// Make room for one more connection: drop every stale buffer, and if
+    /// none were stale, drop the least recently updated one.
+    fn evict(&mut self) {
+        let now = Instant::now();
+        self.buffers
+            .retain(|_, (last, _)| now.duration_since(*last) < STALE_AFTER);
+        if self.buffers.len() >= MAX_CONNS {
+            if let Some(oldest) = self
+                .buffers
+                .iter()
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(k, _)| *k)
+            {
+                self.buffers.remove(&oldest);
+            }
+        }
     }
 }
 
 fn is_complete_http_request(text: &str) -> bool {
     // Has headers + body separator
-    let has_separator = text.contains("\r\n\r\n") || text.contains("\n\n");
-    if !has_separator {
+    let header_end = text.find("\r\n\r\n").or_else(|| text.find("\n\n"));
+    let Some(header_end) = header_end else {
         return false;
-    }
+    };
 
-    // If POST/PUT, check Content-Length vs actual body length
-    if let Some(cl_str) = extract_header_value(text, "content-length") {
+    // If POST/PUT, check Content-Length vs actual body length. Only look in
+    // the header section so a body can't smuggle in a fake Content-Length.
+    if let Some(cl_str) = extract_header_value(&text[..header_end], "content-length") {
         if let Ok(cl) = cl_str.trim().parse::<usize>() {
             // Don't wait forever for an implausibly large (or attacker-forged)
             // body: treat the request as complete at the header boundary so
@@ -298,23 +336,81 @@ fn is_complete_http_request(text: &str) -> bool {
             return text.len() >= body_start + cl;
         }
     }
-    has_separator
+    true
 }
 
-fn extract_header_value<'a>(text: &'a str, header: &str) -> Option<&'a str> {
-    let search = format!("{}: ", header.to_lowercase());
-    let lower = text.to_lowercase();
-    let start = lower.find(&search)? + search.len();
-    let rest = &text[start..];
-    let end = rest
-        .find('\r')
-        .or_else(|| rest.find('\n'))
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
+fn extract_header_value<'a>(headers: &'a str, header: &str) -> Option<&'a str> {
+    // Match whole header names at line start only: a substring search would
+    // pick up e.g. "x-content-length:" and let a client desync reassembly.
+    // Byte offsets come straight from `headers` (no Unicode lowercasing,
+    // which can change lengths and make slicing panic on attacker input).
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(header)
+            .then(|| value.trim())
+    })
 }
 
 impl Default for StreamReassembler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap(pid: u32, fd: i32, text: &str) -> SslCapture {
+        SslCapture {
+            pid,
+            fd,
+            direction: SslDirection::Write,
+            text: text.to_string(),
+            timestamp: chrono::Utc::now(),
+            account_id: None,
+            conn_key: None,
+        }
+    }
+
+    #[test]
+    fn non_ascii_headers_do_not_panic() {
+        // 'İ' lowercases to a longer byte sequence under Unicode rules.
+        let req = format!(
+            "POST /v1/messages HTTP/1.1\r\nX-Pad: {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            "İ".repeat(64)
+        );
+        let mut r = StreamReassembler::new();
+        assert!(r.feed(cap(1, 1, &req)).is_some());
+    }
+
+    #[test]
+    fn content_length_only_from_headers() {
+        let req = "POST / HTTP/1.1\r\nX-Content-Length: 999\r\n\r\ncontent-length: 999";
+        assert!(is_complete_http_request(req));
+        let partial = "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc";
+        assert!(!is_complete_http_request(partial));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let a = derive_account_id("Bearer sk-test");
+        assert_eq!(a, derive_account_id("bearer sk-test"));
+        assert_eq!(a, derive_account_id("BEARER   sk-test "));
+        assert_eq!(a, derive_account_id("sk-test"));
+    }
+
+    #[test]
+    fn full_map_still_tracks_new_connections() {
+        let mut r = StreamReassembler::new();
+        for fd in 0..MAX_CONNS as i32 {
+            assert!(r.feed(cap(7, fd, "POST / HTTP/1.1\r\n")).is_none());
+        }
+        assert_eq!(r.buffers.len(), MAX_CONNS);
+        // A new connection must still be reassembled once the map is full.
+        assert!(r.feed(cap(8, 1, "POST / HTTP/1.1\r\n")).is_none());
+        assert!(r.feed(cap(8, 1, "Content-Length: 0\r\n\r\n")).is_some());
+        assert!(r.buffers.len() <= MAX_CONNS);
     }
 }
