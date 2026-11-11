@@ -17,7 +17,7 @@
 
 This is distinct from "prompt injection" or "jailbreaking" — the attacker is not trying to bypass safety filters, they are trying to _steal the model's knowledge_ at industrial scale.
 
-Glasswally detects distillation campaigns by fusing 10 complementary behavioral signals, all without reading plaintext prompts.
+Glasswally detects distillation campaigns by fusing 16 complementary signals. Most are behavioral (timing, fingerprints, infrastructure), but the content workers (CoT, Embed, RolePreamble, RefusalProbe, SequenceModel, Biometric, Watermark) **do read prompt text**, and eBPF mode captures TLS plaintext on the monitored host — deploy and scope it accordingly (see `lab.md`).
 
 ---
 

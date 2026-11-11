@@ -111,22 +111,37 @@ impl GlasswallLoader {
         // OpenSSL
         if let Some(p) = find_library(OPENSSL_PATHS, "libssl") {
             info!("Attaching OpenSSL: {}", p.display());
-            self.attach_ssl_pair(&p, SSL_WRITE_SYMS, SSL_READ_SYMS).ok();
-            report.openssl = Some(p);
+            // Only report the library as covered if the probes really
+            // attached; a swallowed error here meant "active" was printed
+            // while nothing was being captured.
+            match self.attach_ssl_pair(&p, SSL_WRITE_SYMS, SSL_READ_SYMS) {
+                Ok(()) => report.openssl = Some(p),
+                Err(e) => warn!("OpenSSL attach failed {}: {}", p.display(), e),
+            }
         }
 
         // BoringSSL (Chrome, some Go) — uses SSL_write with capital S
         if let Some(p) = find_library(BORINGSSL_PATHS, "boringssl") {
             info!("Attaching BoringSSL: {}", p.display());
-            self.attach_ssl_pair(&p, SSL_WRITE_SYMS, SSL_READ_SYMS).ok();
-            report.boringssl = Some(p);
+            // Only report the library as covered if the probes really
+            // attached; a swallowed error here meant "active" was printed
+            // while nothing was being captured.
+            match self.attach_ssl_pair(&p, SSL_WRITE_SYMS, SSL_READ_SYMS) {
+                Ok(()) => report.boringssl = Some(p),
+                Err(e) => warn!("BoringSSL attach failed {}: {}", p.display(), e),
+            }
         }
 
         // NSS (Firefox, some curl builds) — uses PR_Write / PR_Read
         if let Some(p) = find_library(NSS_PATHS, "nss") {
             info!("Attaching NSS: {}", p.display());
-            self.attach_ssl_pair(&p, NSS_WRITE_SYMS, NSS_READ_SYMS).ok();
-            report.nss = Some(p);
+            // Only report the library as covered if the probes really
+            // attached; a swallowed error here meant "active" was printed
+            // while nothing was being captured.
+            match self.attach_ssl_pair(&p, NSS_WRITE_SYMS, NSS_READ_SYMS) {
+                Ok(()) => report.nss = Some(p),
+                Err(e) => warn!("NSS attach failed {}: {}", p.display(), e),
+            }
         }
 
         // Go crypto/tls — scan running processes for Go binaries with TLS
@@ -322,18 +337,26 @@ fn find_go_tls_binaries() -> Vec<PathBuf> {
     found
 }
 
-fn is_go_tls_binary(path: &PathBuf) -> bool {
-    let Ok(data) = std::fs::read(path) else {
-        return false;
-    };
-    if data.len() > 256 * 1024 * 1024 {
-        return false;
+/// Largest executable the loader will read into memory while looking for Go
+/// TLS symbols. The paths come from /proc/*/exe, i.e. from any local user's
+/// processes, and this daemon runs privileged: the size must be checked
+/// *before* reading, or a multi-gigabyte (sparse) binary exhausts memory.
+const MAX_SCAN_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
+fn read_bounded(path: &PathBuf) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SCAN_BINARY_BYTES {
+        return None;
     }
-    memfind(&data, b"crypto/tls")
+    std::fs::read(path).ok()
+}
+
+fn is_go_tls_binary(path: &PathBuf) -> bool {
+    read_bounded(path).is_some_and(|data| memfind(&data, b"crypto/tls"))
 }
 
 fn find_go_symbol_offset(path: &PathBuf, syms: &[&str]) -> Option<u64> {
-    let data = std::fs::read(path).ok()?;
+    let data = read_bounded(path)?;
     for sym in syms {
         let needle = sym.as_bytes();
         let mut pos = 0usize;

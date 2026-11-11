@@ -95,33 +95,65 @@ fn parse_http_request(text: &str, capture: &SslCapture) -> Option<HttpRequest> {
         }
     }
 
-    // Extract specific headers
-    let _user_agent = header_value(&headers, "user-agent").unwrap_or_default();
-    let auth = header_value(&headers, "authorization")
-        .or_else(|| header_value(&headers, "x-api-key"))
-        .unwrap_or_default();
-    let content_type = header_value(&headers, "content-type").unwrap_or_default();
+    // Derive account ids from the presented credentials.
+    // In Anthropic's API: x-api-key: sk-ant-... ; OpenAI-compatible APIs use
+    // Authorization: Bearer ... . We hash the key — the raw value is never
+    // stored.
+    //
+    // A request may carry several credentials (both headers, or a repeated
+    // header). Which one the backend honours is its business and we cannot
+    // know it here, so picking one would let a client choose its own
+    // identity: send the real key in the header the backend reads and a
+    // fresh random value in the header we read, and every request lands on
+    // a brand-new "account". Instead the request is attributed to *every*
+    // presented credential, so the real account always accumulates it.
+    let mut account_ids: Vec<String> = Vec::new();
+    for (name, value) in &headers {
+        if (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key"))
+            && !value.is_empty()
+        {
+            let id = derive_account_id(value);
+            if !account_ids.contains(&id) {
+                account_ids.push(id);
+            }
+        }
+    }
+    if account_ids.len() > MAX_CREDENTIALS {
+        // Keep both ends: backends take either the first or the last value.
+        let tail = account_ids.split_off(account_ids.len() - MAX_CREDENTIALS / 2);
+        account_ids.truncate(MAX_CREDENTIALS / 2);
+        account_ids.extend(tail);
+    }
+    let mut account_ids = account_ids.into_iter();
+    let account_id = account_ids.next().or_else(|| capture.account_id.clone());
+    let alt_account_ids: Vec<String> = account_ids.collect();
 
-    // Derive account_id from auth header
-    // In Anthropic's API: Authorization: Bearer sk-ant-...
-    // We hash it for privacy — we don't need the raw key
-    let account_id = if !auth.is_empty() {
-        Some(derive_account_id(&auth))
+    // De-chunk the body if the client used chunked transfer encoding.
+    let body = if is_chunked(&headers) {
+        dechunk(&body).unwrap_or(body)
     } else {
-        capture.account_id.clone()
+        body
     };
 
-    // Extract model + prompt from JSON body
-    let (model, prompt, token_count) = if content_type.contains("json") && !body.is_empty() {
+    // Extract model + prompt from the JSON body. The Content-Type header is
+    // client-controlled and matched loosely: gating on an exact, lowercase
+    // "json" let `Content-Type: application/JSON` (or no header at all)
+    // hide the prompt from every content-based worker.
+    let content_type = header_value(&headers, "content-type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let parsed = if !body.is_empty()
+        && (content_type.contains("json") || body.trim_start().starts_with('{'))
+    {
         extract_from_json_body(&body)
     } else {
-        (None, None, None)
+        BodyFields::default()
     };
 
     // Extract model from path if not in body
     // Anthropic API: POST /v1/messages, model in body
     // OpenAI compat: POST /v1/chat/completions
-    let model = model.or_else(|| extract_model_from_path(&path));
+    let model = parsed.model.or_else(|| extract_model_from_path(&path));
 
     Some(HttpRequest {
         conn_key: capture.conn_key.clone(),
@@ -132,9 +164,50 @@ fn parse_http_request(text: &str, capture: &SslCapture) -> Option<HttpRequest> {
         timestamp: capture.timestamp,
         account_id,
         model,
-        prompt,
-        token_count,
+        prompt: parsed.prompt,
+        token_count: parsed.max_tokens,
+        system_prompt_hash: parsed.system_prompt_hash,
+        alt_account_ids,
     })
+}
+
+/// Distinct credentials attributed per request (first half + last half).
+const MAX_CREDENTIALS: usize = 8;
+
+fn is_chunked(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    })
+}
+
+/// Decode a chunked body. Returns None until the terminating zero-length
+/// chunk is present (i.e. the body is still incomplete) or if the framing is
+/// malformed.
+fn dechunk(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+    loop {
+        let line_end = pos + bytes[pos..].iter().position(|&b| b == b'\n')?;
+        let size_line = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
+        // Drop chunk extensions (";name=value") and the trailing CR.
+        let size_hex = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        pos = line_end + 1;
+        if size == 0 {
+            return Some(String::from_utf8_lossy(&out).into_owned());
+        }
+        let end = pos.checked_add(size)?;
+        out.extend_from_slice(bytes.get(pos..end)?);
+        pos = end;
+        // Skip the CRLF (or bare LF) that closes the chunk.
+        if bytes.get(pos) == Some(&b'\r') {
+            pos += 1;
+        }
+        if bytes.get(pos) == Some(&b'\n') {
+            pos += 1;
+        }
+    }
 }
 
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
@@ -166,36 +239,86 @@ fn derive_account_id(auth: &str) -> String {
     hex::encode(&hasher.finalize()[..16])
 }
 
-fn extract_from_json_body(body: &str) -> (Option<String>, Option<String>, Option<u32>) {
+#[derive(Default)]
+struct BodyFields {
+    model: Option<String>,
+    prompt: Option<String>,
+    max_tokens: Option<u32>,
+    system_prompt_hash: Option<String>,
+}
+
+/// Text of a message `content` value: either a plain string or an array of
+/// content blocks (`[{"type":"text","text":"..."}, ...]`). The block form is
+/// the standard shape for multimodal / tool-use requests; reading only the
+/// string form left every such prompt empty.
+fn content_text(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    let parts: Vec<&str> = v
+        .as_array()?
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn extract_from_json_body(body: &str) -> BodyFields {
     // Fast path: try serde_json
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         let model = v["model"].as_str().map(|s| s.to_string());
+        let msgs = v["messages"].as_array();
 
         // Extract prompt from Anthropic messages format:
         // {"messages": [{"role": "user", "content": "..."}]}
-        let prompt = v["messages"]
-            .as_array()
+        let prompt = msgs
             .and_then(|msgs| {
                 msgs.iter()
                     .rev()
                     .find(|m| m["role"] == "user")
-                    .and_then(|m| m["content"].as_str())
-                    .map(|s| s.to_string())
+                    .and_then(|m| content_text(&m["content"]))
             })
             // Also check direct "prompt" field (legacy)
             .or_else(|| v["prompt"].as_str().map(|s| s.to_string()));
 
-        // max_tokens as a proxy for expected response size
-        let token_count = v["max_tokens"].as_u64().map(|t| t as u32);
+        // System prompt: top-level "system" (Anthropic) or a role=system
+        // message (OpenAI-compatible). Hashed for preamble-collision
+        // detection; the text itself is not kept.
+        let system = content_text(&v["system"]).or_else(|| {
+            msgs.and_then(|msgs| {
+                msgs.iter()
+                    .find(|m| m["role"] == "system" || m["role"] == "developer")
+                    .and_then(|m| content_text(&m["content"]))
+            })
+        });
+        let system_prompt_hash = system
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| crate::workers::role_preamble::preamble_hash(&s));
 
-        return (model, prompt, token_count);
+        // max_tokens as a proxy for expected response size
+        let max_tokens = v["max_tokens"]
+            .as_u64()
+            .or_else(|| v["max_completion_tokens"].as_u64())
+            .map(|t| t.min(u32::MAX as u64) as u32);
+
+        return BodyFields {
+            model,
+            prompt,
+            max_tokens,
+            system_prompt_hash,
+        };
     }
 
-    // Slow path: regex-free text extraction for malformed JSON
-    let model = extract_json_string(body, "model");
-    let prompt = None; // Don't attempt on malformed JSON
-
-    (model, prompt, None)
+    // Slow path: regex-free text extraction for malformed JSON.
+    // Don't attempt the prompt on malformed JSON.
+    BodyFields {
+        model: extract_json_string(body, "model"),
+        ..BodyFields::default()
+    }
 }
 
 fn extract_json_string(text: &str, key: &str) -> Option<String> {
@@ -318,6 +441,21 @@ fn is_complete_http_request(text: &str) -> bool {
         return false;
     };
 
+    // Chunked bodies have no Content-Length: the request is complete once
+    // the terminating zero-length chunk has arrived. Treating it as complete
+    // at the header boundary dropped the whole body (and with it the prompt).
+    let header_text = &text[..header_end];
+    let chunked = extract_header_value(header_text, "transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    if chunked {
+        let body_start = if text[header_end..].starts_with("\r\n\r\n") {
+            header_end + 4
+        } else {
+            header_end + 2
+        };
+        return dechunk(&text[body_start..]).is_some();
+    }
+
     // If POST/PUT, check Content-Length vs actual body length. Only look in
     // the header section so a body can't smuggle in a fake Content-Length.
     if let Some(cl_str) = extract_header_value(&text[..header_end], "content-length") {
@@ -399,6 +537,68 @@ mod tests {
         assert_eq!(a, derive_account_id("bearer sk-test"));
         assert_eq!(a, derive_account_id("BEARER   sk-test "));
         assert_eq!(a, derive_account_id("sk-test"));
+    }
+
+    #[test]
+    fn every_presented_credential_is_attributed() {
+        // Real key where the backend reads it, a throwaway where we used to.
+        let mk = |decoy: &str| {
+            format!(
+                "POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer {decoy}\r\n\
+                 x-api-key: sk-real\r\nContent-Length: 2\r\n\r\n{{}}"
+            )
+        };
+        let real = derive_account_id("sk-real");
+        let mut r = StreamReassembler::new();
+        for decoy in ["rand-1", "rand-2"] {
+            let req = r.feed(cap(1, 1, &mk(decoy))).unwrap();
+            let ids: Vec<String> = crate::events::ApiEvent::all_from_http_request(&req)
+                .into_iter()
+                .map(|e| e.account_id)
+                .collect();
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&real), "real account must see every request");
+        }
+    }
+
+    #[test]
+    fn content_type_case_and_block_content_do_not_hide_prompt() {
+        let body = r#"{"model":"m","max_tokens":4096,"system":[{"type":"text","text":"You are an expert."}],"messages":[{"role":"user","content":[{"type":"text","text":"explain step by step"}]}]}"#;
+        for ct in ["application/JSON", "text/plain"] {
+            let req = format!(
+                "POST /v1/messages HTTP/1.1\r\nx-api-key: k\r\nContent-Type: {ct}\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let got = StreamReassembler::new().feed(cap(1, 1, &req)).unwrap();
+            assert_eq!(got.prompt.as_deref(), Some("explain step by step"));
+            assert!(got.system_prompt_hash.is_some());
+            let ev = crate::events::ApiEvent::from_http_request(&got).unwrap();
+            assert_eq!(ev.max_tokens, Some(4096));
+        }
+    }
+
+    #[test]
+    fn chunked_body_is_reassembled_and_parsed() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"show every step"}]}"#;
+        let (a, b) = body.split_at(20);
+        let head = "POST /v1/messages HTTP/1.1\r\nx-api-key: k\r\n\
+                    Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut r = StreamReassembler::new();
+        assert!(r.feed(cap(1, 1, head)).is_none());
+        assert!(r
+            .feed(cap(1, 1, &format!("{:x}\r\n{a}\r\n", a.len())))
+            .is_none());
+        let got = r
+            .feed(cap(
+                1,
+                1,
+                &format!("{:X};ext=1\r\n{b}\r\n0\r\n\r\n", b.len()),
+            ))
+            .unwrap();
+        assert_eq!(got.prompt.as_deref(), Some("show every step"));
+        assert_eq!(dechunk("zz\r\n"), None);
+        assert_eq!(dechunk("ffffffffffffffff\r\nab"), None);
     }
 
     #[test]

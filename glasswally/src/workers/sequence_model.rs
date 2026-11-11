@@ -298,10 +298,8 @@ impl MarkovChain {
 
 pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSignal> {
     let window = store.get_window(&event.account_id)?;
-    let prompts: Vec<String> = {
-        let w = window.read();
-        w.events.iter().map(|e| e.prompt.clone()).collect()
-    };
+    // Bounded: re-scanning the full window on every event is quadratic.
+    let prompts: Vec<String> = window.read().recent_prompts();
 
     if prompts.len() < MIN_PROMPTS {
         return None;
