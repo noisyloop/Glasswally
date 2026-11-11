@@ -1,3 +1,5 @@
 /target/
 glasswally-ebpf/target/
 glasswally_output/
+# Enforcement output (account ids, IPs, IOC bundles) — never commit.
+/output/

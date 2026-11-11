@@ -7,7 +7,11 @@
 // distillation is confirmed and the campaign is attributed.
 //
 // Mechanism:
-//   - 32-bit account-specific key: SHA256("gw_wm_v1:" || account_id)
+//   - 32-bit account-specific mark: HMAC-SHA256(secret, "gw_wm_v1:" || account_id)
+//     The secret matters: with a plain hash of the account id, anyone who
+//     knows (or guesses) an account id could compute that account's mark,
+//     plant it in a dataset and frame the account as the leak source — or
+//     confirm and strip their own mark with certainty.
 //   - Encoded as ZWJ (bit=1) / ZWNJ (bit=0) inserted after spaces in text
 //   - Invisible to readers, survives most copy-paste operations
 //   - Detectable by scanning for ZWJ/ZWNJ sequences, comparing to registry
@@ -19,7 +23,7 @@
 
 use chrono::Utc;
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::events::{ApiEvent, DetectionSignal, WorkerKind};
 use crate::state::window::StateStore;
@@ -27,26 +31,36 @@ use crate::state::window::StateStore;
 const ZWJ: char = '\u{200D}'; // zero-width joiner   → bit 1
 const ZWNJ: char = '\u{200C}'; // zero-width non-joiner → bit 0
 
+/// Minimum length of the watermark secret.
+pub const MIN_WATERMARK_KEY_LEN: usize = 32;
+
 /// Generate 32 deterministic watermark bits for an account.
-/// Derived from SHA256("gw_wm_v1:" || account_id).
-pub fn account_watermark_bits(account_id: &str) -> [bool; 32] {
-    let mut h = Sha256::new();
-    h.update(b"gw_wm_v1:");
-    h.update(account_id.as_bytes());
-    let d = h.finalize();
-    let mut bits = [false; 32];
-    for i in 0..32 {
-        bits[i] = (d[i / 8] >> (i % 8)) & 1 == 1;
+/// Derived from HMAC-SHA256(key, "gw_wm_v1:" || account_id). Returns None if
+/// the key is too short — there is deliberately no default key.
+pub fn account_watermark_bits(key: &[u8], account_id: &str) -> Option<[bool; 32]> {
+    use hmac::{Hmac, Mac};
+    if key.len() < MIN_WATERMARK_KEY_LEN {
+        return None;
     }
-    bits
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    mac.update(b"gw_wm_v1:");
+    mac.update(account_id.as_bytes());
+    let d = mac.finalize().into_bytes();
+    let mut bits = [false; 32];
+    for (i, bit) in bits.iter_mut().enumerate() {
+        *bit = (d[i / 8] >> (i % 8)) & 1 == 1;
+    }
+    Some(bits)
 }
 
 /// Embed the account's watermark into a response string.
 ///
 /// Inserts ZWJ (bit=1) or ZWNJ (bit=0) immediately after each space.
 /// The 32-bit sequence cycles across the full text.
-pub fn embed(text: &str, account_id: &str) -> String {
-    let bits = account_watermark_bits(account_id);
+/// Returns None if the key is unusable (the text must then be sent unmarked
+/// and the failure surfaced, never marked with a guessable pattern).
+pub fn embed(text: &str, account_id: &str, key: &[u8]) -> Option<String> {
+    let bits = account_watermark_bits(key, account_id)?;
     let mut out = String::with_capacity(text.len() + text.len() / 5);
     let mut bit_idx = 0usize;
 
@@ -57,12 +71,12 @@ pub fn embed(text: &str, account_id: &str) -> String {
             bit_idx += 1;
         }
     }
-    out
+    Some(out)
 }
 
 /// Scan text for a watermark matching any of the known accounts.
 /// Returns (account_id, confidence 0..1) if ≥85% of bits match.
-pub fn detect(text: &str, accounts: &[String]) -> Option<(String, f32)> {
+pub fn detect(text: &str, accounts: &[String], key: &[u8]) -> Option<(String, f32)> {
     let extracted: Vec<bool> = text
         .chars()
         .filter(|&c| c == ZWJ || c == ZWNJ)
@@ -78,7 +92,7 @@ pub fn detect(text: &str, accounts: &[String]) -> Option<(String, f32)> {
 
     let check_len = extracted.len().min(128);
     for account_id in accounts {
-        let expected = account_watermark_bits(account_id);
+        let expected = account_watermark_bits(key, account_id)?;
         // Try every phase offset: a single inserted/removed space (or a
         // leading stripped marker) shifts the bitstream, which would
         // otherwise defeat detection entirely.
@@ -123,7 +137,9 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         "normalize unicode",
         "remove formatting characters",
     ];
-    let pl = event.prompt.to_lowercase();
+    // Canonical form, but probe for the raw markers separately below —
+    // normalisation strips them.
+    let pl = super::normalize_prompt(&event.prompt);
     let probe_hits: Vec<&str> = probe_terms
         .iter()
         .filter(|&&t| pl.contains(t))
@@ -170,4 +186,27 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         .collect(),
         timestamp: Utc::now(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn watermark_roundtrip_requires_the_key() {
+        let text = "a ".repeat(80);
+        let marked = embed(&text, "acct-1", KEY).unwrap();
+        let accounts = vec!["acct-0".to_string(), "acct-1".to_string()];
+        assert_eq!(detect(&marked, &accounts, KEY).unwrap().0, "acct-1");
+        // A different secret yields a different mark: knowing the account id
+        // alone is not enough to forge or recognise it.
+        let other = b"ffffffffffffffffffffffffffffffff";
+        assert_ne!(
+            account_watermark_bits(KEY, "acct-1"),
+            account_watermark_bits(other, "acct-1")
+        );
+        assert!(embed(&text, "acct-1", b"short").is_none());
+    }
 }

@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: ["main"]
 
+# Least privilege: no job here needs to write to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -35,16 +39,16 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo check (glasswally)
-        run: cargo check -p glasswally
+        run: cargo check -p glasswally --locked
 
       - name: cargo check (xtask)
-        run: cargo check -p xtask
+        run: cargo check -p xtask --locked
 
       - name: cargo test
-        run: cargo test -p glasswally
+        run: cargo test -p glasswally --locked
 
       - name: cargo clippy
-        run: cargo clippy -p glasswally -- -D warnings
+        run: cargo clippy -p glasswally --locked -- -D warnings
 
       - name: cargo fmt
         run: cargo fmt -p glasswally -- --check

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 
 use crate::events::{ApiEvent, DetectionSignal, WorkerKind};
-use crate::state::window::StateStore;
+use crate::state::window::{StateStore, HISTORY_SCAN_LIMIT};
 
 // ── Known role preamble archetypes ────────────────────────────────────────────
 // Each entry is a lowercase substring that strongly suggests a systematic
@@ -74,7 +74,7 @@ const EXTRACTION_ROLE_PATTERNS: &[&str] = &[
 
 // ── Structural hash of system prompt ─────────────────────────────────────────
 
-fn preamble_hash(prompt: &str) -> String {
+pub(crate) fn preamble_hash(prompt: &str) -> String {
     use sha2::{Digest, Sha256};
     // Take first 512 chars, lowercase, strip punctuation noise.
     let normalised: String = prompt
@@ -106,7 +106,7 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         return None;
     };
 
-    let prompt_lower = event.prompt.to_lowercase();
+    let prompt_lower = super::normalize_prompt(&event.prompt);
 
     // ── 1. Archetype keyword scan ─────────────────────────────────────────────
     let mut archetype_hits: Vec<String> = EXTRACTION_ROLE_PATTERNS
@@ -126,8 +126,10 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     let window = store.get_window(&event.account_id)?;
     let preamble_hashes: Vec<String> = {
         let w = window.read();
+        let skip = w.events.len().saturating_sub(HISTORY_SCAN_LIMIT);
         w.events
             .iter()
+            .skip(skip)
             .filter_map(|e| e.system_prompt_hash.clone())
             .collect()
     };

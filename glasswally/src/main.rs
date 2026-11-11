@@ -126,7 +126,14 @@ impl Pipeline {
         }
     }
 
-    async fn process(&self, event: ApiEvent) {
+    async fn process(&self, mut event: ApiEvent) {
+        // Bound and clean every client-influenced field before anything
+        // else touches the event.
+        if !event.sanitize() {
+            tracing::debug!("Dropping event with unusable account id");
+            return;
+        }
+
         // Ingest into sliding windows + indexes
         self.store.ingest(&event);
 
@@ -139,18 +146,31 @@ impl Pipeline {
             None => return,
         };
 
-        if !self.engine.should_alert(&event.account_id) {
+        // Atomic check-and-record: no duplicate dispatch under concurrency,
+        // and a higher tier is never suppressed by a lower-tier cooldown.
+        if !self
+            .engine
+            .try_claim_alert(&event.account_id, decision.tier)
+        {
             return;
         }
 
         // Dispatch enforcement action
         match self.dispatcher.dispatch(&decision, &self.store).await {
             Ok(action) => {
-                self.engine
-                    .record_alert(&event.account_id, decision.tier == RiskTier::Critical);
+                if decision.tier == RiskTier::Critical {
+                    // Record every enforced account, not just the trigger,
+                    // so the query API reports takedown members as suspended.
+                    for account in &action.affected_accounts {
+                        self.engine.mark_suspended(account);
+                    }
+                }
                 print_alert(&decision, &action.action_type);
             }
-            Err(e) => error!("Dispatch failed: {}", e),
+            Err(e) => {
+                self.engine.release_claim(&event.account_id);
+                error!("Dispatch failed: {}", e);
+            }
         }
     }
 }
@@ -178,24 +198,31 @@ fn print_alert(decision: &events::RiskDecision, action: &ActionKind) {
         RiskTier::Low => ("\x1b[92m", "🟢"),
     };
     let reset = "\x1b[0m";
+    // Evidence, ids and labels embed client-chosen strings (model names,
+    // account ids). Strip control characters before they reach a terminal.
     let ev = decision
         .top_evidence
         .iter()
         .take(3)
-        .cloned()
+        .map(|e| events::strip_control(e).into_owned())
         .collect::<Vec<_>>()
         .join(" | ");
     let gt = decision
         .ground_truth
         .as_deref()
-        .map(|g| format!(" \x1b[90m[{}]{}", g, reset))
+        .map(|g| format!(" \x1b[90m[{}]{}", events::strip_control(g), reset))
         .unwrap_or_default();
 
     println!(
         "\n{}{} {} → {}{}",
         color, icon, decision.tier, action, reset
     );
-    println!("  Account : {}{}{}", color, decision.account_id, reset);
+    println!(
+        "  Account : {}{}{}",
+        color,
+        events::strip_control(&decision.account_id),
+        reset
+    );
     println!(
         "  Score   : {}{:.4}{}",
         color, decision.composite_score, reset
@@ -221,13 +248,32 @@ async fn print_stats_loop(store: Arc<StateStore>, start: Instant) {
 
 // ── Event sources ─────────────────────────────────────────────────────────────
 
+/// (device, inode) of an open file — identifies it across renames.
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// How often an idle tail checks whether the feed was rotated or truncated.
+const ROTATION_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 async fn tail_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, seek_end: bool) -> Result<()> {
     let mut file = tokio::fs::File::open(&path).await?;
+    let mut identity = file_identity(&file.metadata().await?);
+    // Bytes consumed from the current file — compared against its length to
+    // notice in-place truncation.
+    let mut offset: u64 = 0;
     if seek_end {
         use tokio::io::AsyncSeekExt;
-        file.seek(std::io::SeekFrom::End(0)).await?;
+        offset = file.seek(std::io::SeekFrom::End(0)).await?;
     }
     let mut reader = BufReader::new(file);
+    let mut last_check = Instant::now();
 
     info!("Tailing {}", path.display());
     // Bytes of the current, not yet newline-terminated line. Reading raw
@@ -245,6 +291,39 @@ async fn tail_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, seek_end: bool) -
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            // At EOF: has the gateway rotated (new inode at `path`) or
+            // truncated (file shorter than what we already read) the log?
+            // Without this check the tail keeps reading the old, now-silent
+            // file forever — detection stops with no error after the first
+            // logrotate.
+            if last_check.elapsed() >= ROTATION_CHECK {
+                last_check = Instant::now();
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    let rotated = file_identity(&meta) != identity;
+                    let truncated = !rotated && meta.len() < offset;
+                    if rotated || truncated {
+                        match tokio::fs::File::open(&path).await {
+                            Ok(f) => {
+                                warn!(
+                                    "Feed {} was {} — reopening from start",
+                                    path.display(),
+                                    if rotated { "rotated" } else { "truncated" }
+                                );
+                                identity = f
+                                    .metadata()
+                                    .await
+                                    .map(|m| file_identity(&m))
+                                    .unwrap_or(identity);
+                                reader = BufReader::new(f);
+                                offset = 0;
+                                line.clear();
+                                oversized = false;
+                            }
+                            Err(e) => warn!("Feed {} not reopenable yet: {e}", path.display()),
+                        }
+                    }
+                }
+            }
             continue;
         }
         let (consumed, complete) = match chunk.iter().position(|&b| b == b'\n') {
@@ -261,6 +340,7 @@ async fn tail_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, seek_end: bool) -
             }
         }
         reader.consume(consumed);
+        offset += consumed as u64;
         if !complete {
             continue;
         }
@@ -301,6 +381,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // A zero, negative or non-finite speed makes the replay delay NaN or
+    // infinite, which panics inside Duration::from_secs_f64.
+    if !(cli.speed.is_finite() && cli.speed > 0.0) {
+        anyhow::bail!("--speed must be a positive, finite number");
+    }
 
     // Eval mode: run the labeled-dataset harness, print the report, exit.
     if matches!(cli.mode, Mode::Eval) {
@@ -324,6 +409,13 @@ async fn main() -> Result<()> {
     // Housekeeping
     let store_hk = Arc::clone(&pipeline.store);
     tokio::spawn(store_hk.housekeeping_loop());
+    let engine_hk = Arc::clone(&pipeline.engine);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+            engine_hk.prune();
+        }
+    });
 
     // Event source
     let tx2 = tx.clone();
@@ -362,9 +454,9 @@ async fn main() -> Result<()> {
                         // Reconstructed requests feed the same channel as
                         // tail/replay — one pipeline, no second code path.
                         if let Some(req) = reassembler.feed(capture) {
-                            if let Some(ev) = ApiEvent::from_http_request(&req) {
+                            for ev in ApiEvent::all_from_http_request(&req) {
                                 if tx2.send(ev).await.is_err() {
-                                    break;
+                                    return;
                                 }
                             }
                         }
@@ -397,7 +489,11 @@ async fn main() -> Result<()> {
             let path = cli.path.clone();
             let speed = cli.speed;
             tokio::spawn(async move {
-                replay_jsonl(path, tx2, speed).await.ok();
+                // Surface the failure instead of reporting an empty,
+                // "successful" replay.
+                if let Err(e) = replay_jsonl(path, tx2, speed).await {
+                    error!("Replay source failed: {e}");
+                }
             });
         }
     }

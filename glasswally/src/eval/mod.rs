@@ -158,7 +158,11 @@ impl Evaluator {
                 continue;
             }
             match serde_json::from_str::<ApiEvent>(line) {
-                Ok(ev) => events.push(ev),
+                Ok(mut ev) => {
+                    if ev.sanitize() {
+                        events.push(ev);
+                    }
+                }
                 Err(e) => tracing::warn!("Eval dataset parse error: {}", e),
             }
         }

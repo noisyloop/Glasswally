@@ -16,7 +16,10 @@ use tracing::info;
 use crate::events::{
     ActionKind, CanaryToken, EnforcementAction, IocBundle, RiskDecision, RiskTier,
 };
-use crate::state::window::StateStore;
+use crate::state::window::{subnet_key, StateStore};
+
+/// Cap on the weakly-linked accounts listed in one review entry.
+const MAX_REVIEW_ACCOUNTS: usize = 512;
 
 pub struct Dispatcher {
     out: PathBuf,
@@ -66,14 +69,32 @@ impl Dispatcher {
         }
 
         // ── CLUSTER TAKEDOWN (Critical tier) ─────────────────────────────────
+        // Group enforcement is limited to accounts *strongly* linked to the
+        // triggering account (shared payment instrument / org id).
+        //
+        // Cluster membership alone is not enough: clusters also form on a
+        // shared /24 or JA3 hash, which anyone can acquire. Suspending the
+        // whole cluster let an attacker enrol bystanders (same HTTP library,
+        // same NAT / cloud egress range) and then deliberately trip a
+        // CRITICAL score to have them all suspended — and published in a
+        // cross-provider IOC bundle. Weakly linked members are sent to the
+        // analyst queue instead.
+        let mut review: Vec<String> = Vec::new();
         if decision.tier == RiskTier::Critical {
             if let Some(cid) = decision.cluster_id {
-                let members: Vec<String> = store.cluster_members(cid).into_iter().collect();
+                let cluster = store.cluster_members(cid);
+                let strong = store.strongly_linked(&decision.account_id);
+                let mut members: Vec<String> = strong.iter().cloned().collect();
+                members.sort();
+                review = cluster.difference(&strong).cloned().collect();
+                review.sort();
+                review.truncate(MAX_REVIEW_ACCOUNTS);
+
                 if members.len() >= 3 {
                     action_type = ActionKind::ClusterTakedown;
                     affected = members.clone();
 
-                    // Build IOC bundle from all cluster member data
+                    // Build IOC bundle from the enforced members' data only
                     let mut ips = std::collections::HashSet::new();
                     let mut payments = std::collections::HashSet::new();
                     let mut ja3s = std::collections::HashSet::new();
@@ -93,20 +114,14 @@ impl Dispatcher {
                         }
                     }
 
-                    let subnets: std::collections::HashSet<String> = ips
-                        .iter()
-                        .filter_map(|ip| {
-                            let p: Vec<&str> = ip.split('.').collect();
-                            if p.len() == 4 {
-                                Some(format!("{}.{}.{}", p[0], p[1], p[2]))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    let subnets: std::collections::HashSet<String> =
+                        ips.iter().filter_map(|ip| subnet_key(ip)).collect();
 
                     // Collect any triggered canaries for this cluster
-                    let triggered_canaries = store.triggered_canaries_for_cluster(cid);
+                    let triggered_canaries: Vec<String> = store
+                        .triggered_canaries_for_cluster(cid)
+                        .into_iter()
+                        .collect();
 
                     let ioc = IocBundle {
                         cluster_id: cid,
@@ -131,9 +146,10 @@ impl Dispatcher {
                     self.write("ioc_bundles.jsonl", &(serde_json::to_string(&ioc)? + "\n"))
                         .await?;
                     info!(
-                        "CLUSTER_TAKEDOWN cluster={} accounts={}",
+                        "CLUSTER_TAKEDOWN cluster={} accounts={} review={}",
                         cid,
-                        affected.len()
+                        affected.len(),
+                        review.len()
                     );
                 }
             }
@@ -167,16 +183,128 @@ impl Dispatcher {
         }
         self.write("audit_log.jsonl", &line).await?;
 
+        // Weakly linked cluster members: human review, never auto-enforced.
+        if !review.is_empty() {
+            let flag = EnforcementAction {
+                action_type: ActionKind::FlagForReview,
+                account_id: None,
+                cluster_id: decision.cluster_id,
+                affected_accounts: review,
+                reason: format!(
+                    "share only weak infrastructure (subnet/JA3) with critical account {}; \
+                     not auto-suspended",
+                    decision.account_id
+                ),
+                evidence: decision.top_evidence.clone(),
+                composite_score: decision.composite_score,
+                canary_token: None,
+                timestamp: Utc::now(),
+            };
+            let line = flag.to_jsonl() + "\n";
+            self.write("analyst_queue.jsonl", &line).await?;
+            self.write("audit_log.jsonl", &line).await?;
+        }
+
         Ok(action)
     }
 
     async fn write(&self, file: &str, content: &str) -> Result<()> {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.out.join(file))
-            .await?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // Owner-only: these files hold account ids, IPs and evidence. The
+        // directory is 0700 when we create it, but an operator-supplied
+        // existing directory may not be.
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts.open(self.out.join(file)).await?;
         f.write_all(content.as_bytes()).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::test_event;
+    use std::collections::HashMap;
+
+    fn critical(account: &str, store: &StateStore) -> RiskDecision {
+        RiskDecision {
+            account_id: account.into(),
+            composite_score: 0.9,
+            tier: RiskTier::Critical,
+            signal_scores: HashMap::new(),
+            top_evidence: vec![],
+            country_codes: vec![],
+            cluster_id: store.get_cluster(account),
+            n_requests_seen: 1,
+            action: ActionKind::SuspendAccount,
+            timestamp: Utc::now(),
+            ground_truth: None,
+        }
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gw-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// An attacker shares a JA3 (same HTTP library) with bystanders, then
+    /// trips CRITICAL. Bystanders must not be suspended or exported as IOCs.
+    #[tokio::test]
+    async fn takedown_spares_weakly_linked_bystanders() {
+        let store = StateStore::new();
+        for acct in ["atk1", "atk2", "atk3"] {
+            let mut e = test_event(acct, "hi");
+            e.payment_method_hash = Some("ring-card".into());
+            e.ja3_hash = Some("common-ja3".into());
+            store.ingest(&e);
+        }
+        for (i, acct) in ["victim1", "victim2", "victim3"].iter().enumerate() {
+            let mut e = test_event(acct, "hi");
+            e.ip_address = format!("198.51.{}.7", i).parse().unwrap();
+            e.payment_method_hash = Some(format!("own-card-{i}"));
+            e.ja3_hash = Some("common-ja3".into());
+            store.ingest(&e);
+        }
+        let dir = tmp_dir("takedown");
+        let d = Dispatcher::new(&dir);
+        let action = d.dispatch(&critical("atk1", &store), &store).await.unwrap();
+
+        assert_eq!(action.action_type, ActionKind::ClusterTakedown);
+        assert_eq!(action.affected_accounts, ["atk1", "atk2", "atk3"]);
+        let ioc = std::fs::read_to_string(dir.join("ioc_bundles.jsonl")).unwrap();
+        assert!(!ioc.contains("victim") && !ioc.contains("198.51."));
+        let queue = std::fs::read_to_string(dir.join("analyst_queue.jsonl")).unwrap();
+        assert!(queue.contains("victim1") && queue.contains("FlagForReview"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lone attacker in a JA3-only cluster gets a single-account suspension.
+    #[tokio::test]
+    async fn weak_only_cluster_is_not_taken_down() {
+        let store = StateStore::new();
+        for acct in ["atk", "v1", "v2", "v3"] {
+            let mut e = test_event(acct, "hi");
+            e.payment_method_hash = Some(format!("card-{acct}"));
+            store.ingest(&e); // all share 10.0.0.0/24
+        }
+        let dir = tmp_dir("weak");
+        let d = Dispatcher::new(&dir);
+        let action = d.dispatch(&critical("atk", &store), &store).await.unwrap();
+        assert_eq!(action.action_type, ActionKind::SuspendAccount);
+        assert_eq!(action.affected_accounts, ["atk"]);
+        assert!(!dir.join("ioc_bundles.jsonl").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("audit_log.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "output files must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,6 +11,87 @@ use std::net::IpAddr;
 
 pub const MAX_BUF: usize = 4096;
 
+// ── Ingest-boundary limits ────────────────────────────────────────────────────
+// Every field of an ApiEvent is ultimately client- or gateway-supplied. These
+// caps are applied once, in `ApiEvent::sanitize`, before the event reaches the
+// state store or any worker, so no later stage has to reason about unbounded
+// or control-character-laden input.
+
+/// Events whose account id is empty or longer than this are dropped.
+pub const MAX_ACCOUNT_ID_BYTES: usize = 256;
+/// Prompt bytes the workers will analyse. Longer prompts keep their head and
+/// tail (extraction instructions sit at one end or the other).
+pub const MAX_ANALYZED_PROMPT_BYTES: usize = 32 * 1024;
+/// Cap for short metadata strings (user agent, model, hashes, ASN org ...).
+pub const MAX_FIELD_BYTES: usize = 512;
+/// Cap on the number of header names kept for fingerprinting.
+pub const MAX_HEADERS: usize = 64;
+/// Cap on a single header name.
+pub const MAX_HEADER_NAME_BYTES: usize = 64;
+/// Timestamps further in the future than this are replaced with "now": a
+/// future-dated event never ages out of the sliding windows.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 300;
+
+/// Largest index `<= max` that is a char boundary of `s`.
+fn floor_boundary(s: &str, max: usize) -> usize {
+    let mut i = max.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest index `>= min` that is a char boundary of `s`.
+fn ceil_boundary(s: &str, min: usize) -> usize {
+    let mut i = min.min(s.len());
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Shorten `s` to at most `max` bytes, keeping the first three quarters and
+/// the last quarter. Never splits a multi-byte character.
+pub fn truncate_middle(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let head = floor_boundary(s, max - max / 4);
+    let tail = ceil_boundary(s, s.len() - max / 4);
+    let mut out = String::with_capacity(head + (s.len() - tail) + 1);
+    out.push_str(&s[..head]);
+    out.push('\n');
+    out.push_str(&s[tail..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Remove control characters (ESC, CR, NUL ...) so a client-chosen string
+/// cannot inject terminal escape sequences or forge log lines when it is
+/// later echoed in an alert.
+pub fn strip_control(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(s.chars().filter(|c| !c.is_control()).collect())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// In-place: strip control characters and cap at `max` bytes.
+fn clean_field(s: &mut String, max: usize) {
+    if let std::borrow::Cow::Owned(clean) = strip_control(s) {
+        *s = clean;
+    }
+    if s.len() > max {
+        s.truncate(floor_boundary(s, max));
+    }
+}
+
+fn clean_opt(s: &mut Option<String>, max: usize) {
+    if let Some(v) = s {
+        clean_field(v, max);
+    }
+}
+
 // ── Raw events from BPF ───────────────────────────────────────────────────────
 
 /// Raw SSL event from kernel — plaintext captured at ssl_write/ssl_read.
@@ -101,6 +182,13 @@ pub struct HttpRequest {
     pub model: Option<String>,  // extracted from path or body
     pub prompt: Option<String>, // extracted from JSON body
     pub token_count: Option<u32>,
+    /// Hash of the system prompt / role preamble, when the body carries one.
+    #[serde(default)]
+    pub system_prompt_hash: Option<String>,
+    /// Further account ids derived from *other* credentials presented on the
+    /// same request (see `http_reconstruct`). Empty for a normal request.
+    #[serde(default)]
+    pub alt_account_ids: Vec<String>,
 }
 
 impl HttpRequest {
@@ -242,10 +330,72 @@ pub struct ApiEvent {
 }
 
 impl ApiEvent {
+    /// Bound and clean every client-influenced field. Must be called before
+    /// the event is ingested. Returns `false` when the event cannot be
+    /// attributed safely (unusable account id) and should be dropped.
+    pub fn sanitize(&mut self) -> bool {
+        // The account id is a map key everywhere; never rewrite it (that
+        // could merge two accounts) — reject instead.
+        if self.account_id.is_empty()
+            || self.account_id.len() > MAX_ACCOUNT_ID_BYTES
+            || self.account_id.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let latest = Utc::now() + chrono::Duration::seconds(MAX_FUTURE_SKEW_SECS);
+        if self.timestamp > latest {
+            self.timestamp = Utc::now();
+        }
+        if let std::borrow::Cow::Owned(p) = truncate_middle(&self.prompt, MAX_ANALYZED_PROMPT_BYTES)
+        {
+            self.prompt = p;
+        }
+        clean_field(&mut self.request_id, MAX_FIELD_BYTES);
+        clean_field(&mut self.user_agent, MAX_FIELD_BYTES);
+        clean_field(&mut self.model, MAX_FIELD_BYTES);
+        clean_field(&mut self.country_code, 8);
+        clean_opt(&mut self.payment_method_hash, MAX_FIELD_BYTES);
+        clean_opt(&mut self.org_id, MAX_FIELD_BYTES);
+        clean_opt(&mut self.ja3_hash, MAX_FIELD_BYTES);
+        clean_opt(&mut self.ja3s_hash, MAX_FIELD_BYTES);
+        clean_opt(&mut self.asn_org, MAX_FIELD_BYTES);
+        clean_opt(&mut self.system_prompt_hash, MAX_FIELD_BYTES);
+        clean_opt(&mut self.campaign_label, MAX_FIELD_BYTES);
+        if let Some(h2) = &mut self.h2_settings {
+            clean_field(&mut h2.fingerprint, MAX_FIELD_BYTES);
+        }
+        self.header_order.truncate(MAX_HEADERS);
+        for h in &mut self.header_order {
+            clean_field(h, MAX_HEADER_NAME_BYTES);
+        }
+        true
+    }
+
     /// Map a reconstructed HTTP request (eBPF capture path) onto the shared
     /// pipeline event type. Fields the kernel capture cannot know yet
     /// (JA3, ASN, geo, payment) are left unset; workers that need them
     /// simply see no signal. Returns None when no account could be derived.
+    /// One event per credential presented on the request (see
+    /// `HttpRequest::alt_account_ids`). A normal request yields one event.
+    pub fn all_from_http_request(req: &HttpRequest) -> Vec<ApiEvent> {
+        let Some(primary) = Self::from_http_request(req) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(1 + req.alt_account_ids.len());
+        for alt in &req.alt_account_ids {
+            let mut ev = primary.clone();
+            ev.request_id = format!(
+                "{}-{}",
+                alt,
+                req.timestamp.timestamp_nanos_opt().unwrap_or(0)
+            );
+            ev.account_id = alt.clone();
+            out.push(ev);
+        }
+        out.insert(0, primary);
+        out
+    }
+
     pub fn from_http_request(req: &HttpRequest) -> Option<ApiEvent> {
         let account_id = req.account_id.clone()?;
         Some(ApiEvent {
@@ -275,8 +425,8 @@ impl ApiEvent {
             tls_library: None,
             asn_number: None,
             asn_org: None,
-            max_tokens: None,
-            system_prompt_hash: None,
+            max_tokens: req.token_count,
+            system_prompt_hash: req.system_prompt_hash.clone(),
             campaign_label: None,
         })
     }
@@ -442,4 +592,74 @@ pub struct IocBundle {
     pub targeted_capabilities: Vec<String>,
     pub confidence: f32,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Minimal benign event for unit tests across the crate.
+#[cfg(test)]
+pub(crate) fn test_event(account: &str, prompt: &str) -> ApiEvent {
+    ApiEvent {
+        request_id: "r".into(),
+        account_id: account.into(),
+        timestamp: Utc::now(),
+        ip_address: "10.0.0.1".parse().unwrap(),
+        user_agent: "ua".into(),
+        model: "m".into(),
+        prompt: prompt.into(),
+        token_count: 1,
+        payment_method_hash: None,
+        org_id: None,
+        country_code: "US".into(),
+        header_order: vec![],
+        ja3_hash: None,
+        ja3s_hash: None,
+        h2_settings: None,
+        tls_library: None,
+        asn_number: None,
+        asn_org: None,
+        max_tokens: None,
+        system_prompt_hash: None,
+        campaign_label: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_event as event;
+    use super::*;
+
+    #[test]
+    fn truncate_middle_respects_char_boundaries() {
+        let s = "é".repeat(5000); // 2 bytes each
+        let t = truncate_middle(&s, 1001);
+        assert!(t.len() <= 1001 + 1);
+        assert!(t.starts_with('é') && t.ends_with('é'));
+        assert_eq!(truncate_middle("short", 100), "short");
+    }
+
+    #[test]
+    fn sanitize_bounds_and_cleans_fields() {
+        let mut e = event("acct", &"x".repeat(MAX_ANALYZED_PROMPT_BYTES * 4));
+        e.model = "claude\x1b[2J\x1b[31mFAKE ALERT".into();
+        e.user_agent = "u".repeat(10_000);
+        e.header_order = vec!["h".repeat(1000); 500];
+        e.timestamp = Utc::now() + chrono::Duration::days(365);
+        assert!(e.sanitize());
+        assert!(e.prompt.len() <= MAX_ANALYZED_PROMPT_BYTES + 1);
+        assert!(!e.model.contains('\x1b'));
+        assert_eq!(e.user_agent.len(), MAX_FIELD_BYTES);
+        assert_eq!(e.header_order.len(), MAX_HEADERS);
+        assert!(e
+            .header_order
+            .iter()
+            .all(|h| h.len() <= MAX_HEADER_NAME_BYTES));
+        assert!(e.timestamp <= Utc::now());
+    }
+
+    #[test]
+    fn sanitize_rejects_unusable_account_ids() {
+        assert!(!event("", "p").sanitize());
+        assert!(!event(&"a".repeat(MAX_ACCOUNT_ID_BYTES + 1), "p").sanitize());
+        assert!(!event("acct\x1b[0m", "p").sanitize());
+        assert!(event("sk-normal", "p").sanitize());
+    }
 }

@@ -32,6 +32,9 @@ use crate::state::window::StateStore;
 
 const DIM: usize = 512;
 
+/// Prompt bytes fed to the embedding (head + tail).
+const MAX_EMBED_BYTES: usize = 4096;
+
 /// Known extraction prompt archetypes — each is a centroid of a cluster of
 /// real prompts observed in distillation campaigns.
 const ARCHETYPES: &[(&str, &str)] = &[
@@ -217,7 +220,15 @@ pub async fn analyze(event: &ApiEvent, _store: &StateStore) -> Option<DetectionS
         return None;
     }
 
-    let normalized = normalize_text(&event.prompt);
+    // Canonicalise first: an invisible character inside a word would
+    // otherwise be turned into a space and split the token.
+    //
+    // Only the head and tail are embedded: each n-gram costs a SHA-256 plus a
+    // 512-wide vector add, so embedding a 32 KiB prompt took ~30 ms of CPU
+    // per event, and a long prompt's vector is too diluted to match a
+    // one-line archetype anyway.
+    let bounded = crate::events::truncate_middle(&event.prompt, MAX_EMBED_BYTES);
+    let normalized = normalize_text(&super::normalize_prompt(&bounded));
     let query_vec = embed_text(&normalized);
     let archetypes = archetype_vecs();
 

@@ -138,7 +138,7 @@ const MIN_REQUESTS: usize = 5;
 const REFUSAL_DENSITY_THRESHOLD: f32 = 0.25;
 
 fn categorize_prompt(prompt: &str) -> HashSet<&'static str> {
-    let lower = prompt.to_lowercase();
+    let lower = super::normalize_prompt(prompt);
     let mut hits = HashSet::new();
     for (cat, keywords) in REFUSAL_CATEGORIES {
         if keywords.iter().any(|&kw| lower.contains(kw)) {
@@ -151,10 +151,8 @@ fn categorize_prompt(prompt: &str) -> HashSet<&'static str> {
 pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSignal> {
     let window = store.get_window(&event.account_id)?;
 
-    let prompts: Vec<String> = {
-        let w = window.read();
-        w.events.iter().map(|e| e.prompt.clone()).collect()
-    };
+    // Bounded: re-scanning the full window on every event is quadratic.
+    let prompts: Vec<String> = window.read().recent_prompts();
 
     if prompts.len() < MIN_REQUESTS {
         return None;

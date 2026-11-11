@@ -34,6 +34,8 @@ use crate::state::window::{StateStore, W_1HR};
 /// Captures: length bucket (per 100 chars) + first word category + dominant verb.
 fn structural_hash(prompt: &str) -> u64 {
     let len_bucket = prompt.len() / 100;
+    // Lowercase once (this used to be recomputed up to 30× per prompt).
+    let lower = prompt.to_lowercase();
     let first_word = prompt
         .split_whitespace()
         .next()
@@ -58,7 +60,7 @@ fn structural_hash(prompt: &str) -> u64 {
         "tell",
     ]
     .iter()
-    .find(|&&v| prompt.to_lowercase().starts_with(v) || prompt.to_lowercase().contains(v))
+    .find(|&&v| lower.contains(v))
     .copied()
     .unwrap_or("other");
 

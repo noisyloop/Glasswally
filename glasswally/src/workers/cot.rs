@@ -107,16 +107,18 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     let (cot_ac, cot_labels) = cot_automaton();
     let (domain_ac, domain_labels) = domain_automaton();
 
-    // Scan current prompt — O(prompt_len)
+    // Scan current prompt — O(prompt_len). Match on the canonical form so
+    // spacing / invisible-character tricks don't hide a pattern.
+    let prompt = super::normalize_prompt(&event.prompt);
     let cot_hits: Vec<&str> = cot_ac
-        .find_iter(&event.prompt)
+        .find_iter(&prompt)
         .map(|m| cot_labels[m.pattern().as_usize()])
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
 
     let domain_hits: Vec<&str> = domain_ac
-        .find_iter(&event.prompt)
+        .find_iter(&prompt)
         .map(|m| domain_labels[m.pattern().as_usize()])
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
@@ -133,7 +135,11 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     // Window-level CoT ratio
     if let Some(window) = store.get_window(&event.account_id) {
         let window = window.read();
-        let prompts = window.prompts_in(W_1HR);
+        let prompts: Vec<String> = window
+            .prompts_in(W_1HR)
+            .iter()
+            .map(|p| super::normalize_prompt(p))
+            .collect();
         let n = prompts.len();
 
         if n >= 5 {
@@ -186,4 +192,24 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         .collect(),
         timestamp: Utc::now(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::test_event;
+
+    #[tokio::test]
+    async fn obfuscated_cot_phrases_still_match() {
+        let store = StateStore::new();
+        for prompt in [
+            "Think  step\nby   step about this",
+            "show your chain\u{200b} of thought",
+            "ｃｈａｉｎ ｏｆ ｔｈｏｕｇｈｔ please",
+        ] {
+            let ev = test_event("a", prompt);
+            let sig = analyze(&ev, &store).await.unwrap();
+            assert!(sig.score >= 0.40, "missed: {prompt:?}");
+        }
+    }
 }

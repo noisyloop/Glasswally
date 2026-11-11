@@ -55,7 +55,8 @@ const MEDIUM: f32 = 0.35;
 const COOLDOWN: i64 = 600; // seconds before re-alerting same account
 
 pub struct FusionEngine {
-    last_alert: DashMap<String, chrono::DateTime<Utc>>,
+    /// account → (time, tier) of the most recent alert.
+    last_alert: DashMap<String, (chrono::DateTime<Utc>, RiskTier)>,
     suspended: DashMap<String, bool>,
 }
 
@@ -155,20 +156,71 @@ impl FusionEngine {
     }
 
     pub fn should_alert(&self, account_id: &str) -> bool {
-        if self.suspended.get(account_id).map(|s| *s).unwrap_or(false) {
+        if self.is_suspended(account_id) {
             return false;
         }
         self.last_alert
             .get(account_id)
-            .map(|t| (Utc::now() - *t).num_seconds() >= COOLDOWN)
+            .map(|t| (Utc::now() - t.0).num_seconds() >= COOLDOWN)
             .unwrap_or(true)
     }
 
-    pub fn record_alert(&self, account_id: &str, suspend: bool) {
-        self.last_alert.insert(account_id.to_string(), Utc::now());
-        if suspend {
-            self.suspended.insert(account_id.to_string(), true);
+    /// Atomically decide whether to alert on `account_id` at `tier`, and if
+    /// so record the alert. Returns true when the caller should dispatch.
+    ///
+    /// Two properties the separate `should_alert` / `record_alert` pair did
+    /// not have:
+    ///   - check-and-set is one operation, so concurrent events for the same
+    ///     account cannot both pass the cooldown and double-dispatch;
+    ///   - the cooldown only suppresses alerts at the same or a lower tier.
+    ///     Previously any alert started a 10-minute window in which nothing
+    ///     else fired, so tripping a cheap MEDIUM (rate-limit) alert bought
+    ///     an account ten minutes of immunity from suspension.
+    pub fn try_claim_alert(&self, account_id: &str, tier: RiskTier) -> bool {
+        use dashmap::mapref::entry::Entry;
+        if self.is_suspended(account_id) {
+            return false;
         }
+        let now = Utc::now();
+        match self.last_alert.entry(account_id.to_string()) {
+            Entry::Vacant(v) => {
+                v.insert((now, tier));
+                true
+            }
+            Entry::Occupied(mut o) => {
+                let (at, last_tier) = *o.get();
+                if (now - at).num_seconds() >= COOLDOWN || tier > last_tier {
+                    o.insert((now, tier));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Undo a claim whose dispatch failed, so the next event can retry.
+    pub fn release_claim(&self, account_id: &str) {
+        self.last_alert.remove(account_id);
+    }
+
+    pub fn mark_suspended(&self, account_id: &str) {
+        self.suspended.insert(account_id.to_string(), true);
+    }
+
+    pub fn record_alert(&self, account_id: &str, suspend: bool) {
+        self.last_alert
+            .insert(account_id.to_string(), (Utc::now(), RiskTier::Low));
+        if suspend {
+            self.mark_suspended(account_id);
+        }
+    }
+
+    /// Forget cooldown entries that have expired (bounds `last_alert`).
+    pub fn prune(&self) {
+        let now = Utc::now();
+        self.last_alert
+            .retain(|_, (at, _)| (now - *at).num_seconds() < COOLDOWN);
     }
 
     /// Returns true if the account is currently suspended (used by gRPC query API).
@@ -186,7 +238,21 @@ impl Default for FusionEngine {
 // Float const arithmetic is not stable; enforce the sum invariant via test.
 #[cfg(test)]
 mod tests {
-    use super::WEIGHTS;
+    use super::*;
+
+    #[test]
+    fn claim_is_exclusive_but_escalation_passes_cooldown() {
+        let e = FusionEngine::new();
+        assert!(e.try_claim_alert("a", RiskTier::Medium));
+        assert!(!e.try_claim_alert("a", RiskTier::Medium));
+        // A cheap MEDIUM alert must not shield the account from CRITICAL.
+        assert!(e.try_claim_alert("a", RiskTier::Critical));
+        assert!(!e.try_claim_alert("a", RiskTier::High));
+        e.mark_suspended("a");
+        assert!(!e.try_claim_alert("a", RiskTier::Critical));
+        e.release_claim("b");
+        assert!(e.try_claim_alert("b", RiskTier::High));
+    }
 
     #[test]
     fn weights_sum_to_one() {
